@@ -109,8 +109,11 @@ struct Session {
         LIST_FIELDS(Session, gc_queue);
 };
 
-Session *session_new(Manager *m, const char *id);
-void session_free(Session *s);
+int session_new(Session **ret, Manager *m, const char *id);
+Session* session_free(Session *s);
+
+DEFINE_TRIVIAL_CLEANUP_FUNC(Session *, session_free);
+
 void session_set_user(Session *s, User *u);
 bool session_may_gc(Session *s, bool drop_not_started);
 void session_add_to_gc_queue(Session *s);
@@ -121,7 +124,7 @@ void session_set_idle_hint(Session *s, bool b);
 int session_get_locked_hint(Session *s);
 void session_set_locked_hint(Session *s, bool b);
 int session_create_fifo(Session *s);
-int session_start(Session *s, sd_bus_message *properties);
+int session_start(Session *s, sd_bus_message *properties, sd_bus_error *error);
 int session_stop(Session *s, bool force);
 int session_finalize(Session *s);
 int session_release(Session *s);

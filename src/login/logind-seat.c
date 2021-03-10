@@ -21,33 +21,42 @@
 #include "terminal-util.h"
 #include "util.h"
 
-Seat *seat_new(Manager *m, const char *id) {
-        Seat *s;
+int seat_new(Seat** ret, Manager *m, const char *id) {
+        _cleanup_(seat_freep) Seat *s = NULL;
+        int r;
 
+        assert(ret);
         assert(m);
         assert(id);
 
-        s = new0(Seat, 1);
+        if (!seat_name_is_valid(id))
+                return -EINVAL;
+
+        s = new(Seat, 1);
         if (!s)
-                return NULL;
+                return -ENOMEM;
+
+        *s = (Seat) {
+                .manager = m,
+        };
 
         s->state_file = strappend("/run/systemd/seats/", id);
         if (!s->state_file)
-                return mfree(s);
+                return -ENOMEM;
 
         s->id = basename(s->state_file);
-        s->manager = m;
 
-        if (hashmap_put(m->seats, s->id, s) < 0) {
-                free(s->state_file);
-                return mfree(s);
-        }
+        r = hashmap_put(m->seats, s->id, s);
+        if (r < 0)
+                return r;
 
-        return s;
+        *ret = TAKE_PTR(s);
+        return 0;
 }
 
-void seat_free(Seat *s) {
-        assert(s);
+Seat* seat_free(Seat *s) {
+        if (!s)
+                return NULL;
 
         if (s->in_gc_queue)
                 LIST_REMOVE(gc_queue, s->manager->seat_gc_queue, s);
@@ -64,7 +73,8 @@ void seat_free(Seat *s) {
 
         free(s->positions);
         free(s->state_file);
-        free(s);
+
+        return mfree(s);
 }
 
 int seat_save(Seat *s) {
@@ -165,7 +175,7 @@ static int vt_allocate(unsigned int vtnr) {
         xsprintf(p, "/dev/tty%u", vtnr);
         fd = open_terminal(p, O_RDWR|O_NOCTTY|O_CLOEXEC);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         return 0;
 }
@@ -421,7 +431,7 @@ int seat_start(Seat *s) {
 }
 
 int seat_stop(Seat *s, bool force) {
-        int r = 0;
+        int r;
 
         assert(s);
 
@@ -431,7 +441,7 @@ int seat_stop(Seat *s, bool force) {
                            "SEAT_ID=%s", s->id,
                            LOG_MESSAGE("Removed seat %s.", s->id));
 
-        seat_stop_sessions(s, force);
+        r = seat_stop_sessions(s, force);
 
         unlink(s->state_file);
         seat_add_to_gc_queue(s);

@@ -5,6 +5,7 @@
 #include <linux/kd.h>
 #include <linux/vt.h>
 #include <signal.h>
+#include <stdio_ext.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -24,57 +25,62 @@
 #include "mkdir.h"
 #include "parse-util.h"
 #include "path-util.h"
+#include "process-util.h"
 #include "string-table.h"
+#include "strv.h"
 #include "terminal-util.h"
 #include "user-util.h"
 #include "util.h"
-#include "process-util.h"
 
 #define RELEASE_USEC (20*USEC_PER_SEC)
 
 static void session_remove_fifo(Session *s);
 
-Session* session_new(Manager *m, const char *id) {
-        Session *s;
+int session_new(Session **ret, Manager *m, const char *id) {
+        _cleanup_(session_freep) Session *s = NULL;
+        int r;
 
+        assert(ret);
         assert(m);
         assert(id);
-        assert(session_id_valid(id));
 
-        s = new0(Session, 1);
+        if (!session_id_valid(id))
+                return -EINVAL;
+
+        s = new(Session, 1);
         if (!s)
-                return NULL;
+                return -ENOMEM;
+
+        *s = (Session) {
+                .manager = m,
+                .fifo_fd = -1,
+                .vtfd = -1,
+                .audit_id = AUDIT_SESSION_INVALID,
+        };
 
         s->state_file = strappend("/run/systemd/sessions/", id);
         if (!s->state_file)
-                return mfree(s);
-
-        s->devices = hashmap_new(&devt_hash_ops);
-        if (!s->devices) {
-                free(s->state_file);
-                return mfree(s);
-        }
+                return -ENOMEM;
 
         s->id = basename(s->state_file);
 
-        if (hashmap_put(m->sessions, s->id, s) < 0) {
-                hashmap_free(s->devices);
-                free(s->state_file);
-                return mfree(s);
-        }
+        s->devices = hashmap_new(&devt_hash_ops);
+        if (!s->devices)
+                return -ENOMEM;
 
-        s->manager = m;
-        s->fifo_fd = -1;
-        s->vtfd = -1;
-        s->audit_id = AUDIT_SESSION_INVALID;
+        r = hashmap_put(m->sessions, s->id, s);
+        if (r < 0)
+                return r;
 
-        return s;
+        *ret = TAKE_PTR(s);
+        return 0;
 }
 
-void session_free(Session *s) {
+Session* session_free(Session *s) {
         SessionDevice *sd;
 
-        assert(s);
+        if (!s)
+                return NULL;
 
         if (s->in_gc_queue)
                 LIST_REMOVE(gc_queue, s->manager->session_gc_queue, s);
@@ -95,6 +101,8 @@ void session_free(Session *s) {
 
                 if (s->user->display == s)
                         s->user->display = NULL;
+
+                user_update_last_session_timer(s->user);
         }
 
         if (s->seat) {
@@ -126,7 +134,8 @@ void session_free(Session *s) {
         hashmap_remove(s->manager->sessions, s->id);
 
         free(s->state_file);
-        free(s);
+
+        return mfree(s);
 }
 
 void session_set_user(Session *s, User *u) {
@@ -135,6 +144,8 @@ void session_set_user(Session *s, User *u) {
 
         s->user = u;
         LIST_PREPEND(sessions_by_user, u->sessions, s);
+
+        user_update_last_session_timer(u);
 }
 
 static void session_save_devices(Session *s, FILE *f) {
@@ -170,20 +181,21 @@ int session_save(Session *s) {
         if (r < 0)
                 goto fail;
 
-        assert(s->user);
-
-        fchmod(fileno(f), 0644);
+        (void) __fsetlocking(f, FSETLOCKING_BYCALLER);
+        (void) fchmod(fileno(f), 0644);
 
         fprintf(f,
                 "# This is private data. Do not parse.\n"
                 "UID="UID_FMT"\n"
                 "USER=%s\n"
                 "ACTIVE=%i\n"
+                "IS_DISPLAY=%i\n"
                 "STATE=%s\n"
                 "REMOTE=%i\n",
                 s->user->uid,
                 s->user->name,
                 session_is_active(s),
+                s->user->display == s,
                 session_state_to_string(session_get_state(s)),
                 s->remote);
 
@@ -354,7 +366,8 @@ int session_load(Session *s) {
                 *monotonic = NULL,
                 *controller = NULL,
                 *active = NULL,
-                *devices = NULL;
+                *devices = NULL,
+                *is_display = NULL;
 
         int k, r;
 
@@ -384,6 +397,7 @@ int session_load(Session *s) {
                            "CONTROLLER",     &controller,
                            "ACTIVE",         &active,
                            "DEVICES",        &devices,
+                           "IS_DISPLAY",     &is_display,
                            NULL);
 
         if (r < 0)
@@ -491,6 +505,18 @@ int session_load(Session *s) {
                         s->was_active = k;
         }
 
+        if (is_display) {
+                /* Note that when enumerating users are loaded before sessions, hence the display session to use is
+                 * something we have to store along with the session and not the user, as in that case we couldn't
+                 * apply it at the time we load the user. */
+
+                k = parse_boolean(is_display);
+                if (k < 0)
+                        log_warning_errno(k, "Failed to parse IS_DISPLAY session property: %m");
+                else if (k > 0)
+                        s->user->display = s;
+        }
+
         if (controller) {
                 if (bus_name_has_owner(s->manager->bus, controller, NULL) > 0) {
                         session_set_controller(s, controller, false, false);
@@ -539,16 +565,17 @@ int session_activate(Session *s) {
         return 0;
 }
 
-static int session_start_scope(Session *s, sd_bus_message *properties) {
+static int session_start_scope(Session *s, sd_bus_message *properties, sd_bus_error *error) {
         int r;
 
         assert(s);
         assert(s->user);
 
         if (!s->scope) {
-                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-                char *scope, *job = NULL;
+                _cleanup_free_ char *scope = NULL;
                 const char *description;
+
+                s->scope_job = mfree(s->scope_job);
 
                 scope = strjoin("session-", s->id, ".scope");
                 if (!scope)
@@ -562,21 +589,16 @@ static int session_start_scope(Session *s, sd_bus_message *properties) {
                                 s->leader,
                                 s->user->slice,
                                 description,
-                                "systemd-logind.service",
-                                "systemd-user-sessions.service",
+                                STRV_MAKE(s->user->runtime_dir_service, s->user->service), /* These two have StopWhenUnneeded= set, hence add a dep towards them */
+                                STRV_MAKE("systemd-logind.service", "systemd-user-sessions.service", s->user->runtime_dir_service, s->user->service), /* And order us after some more */
+                                s->user->home,
                                 properties,
-                                &error,
-                                &job);
-                if (r < 0) {
-                        log_error_errno(r, "Failed to start session scope %s: %s", scope, bus_error_message(&error, r));
-                        free(scope);
-                        return r;
-                } else {
-                        s->scope = scope;
+                                error,
+                                &s->scope_job);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to start session scope %s: %s", scope, bus_error_message(error, r));
 
-                        free(s->scope_job);
-                        s->scope_job = job;
-                }
+                s->scope = TAKE_PTR(scope);
         }
 
         if (s->scope)
@@ -585,13 +607,16 @@ static int session_start_scope(Session *s, sd_bus_message *properties) {
         return 0;
 }
 
-int session_start(Session *s, sd_bus_message *properties) {
+int session_start(Session *s, sd_bus_message *properties, sd_bus_error *error) {
         int r;
 
         assert(s);
 
         if (!s->user)
                 return -ESTALE;
+
+        if (s->stopping)
+                return -EINVAL;
 
         if (s->started)
                 return 0;
@@ -600,8 +625,7 @@ int session_start(Session *s, sd_bus_message *properties) {
         if (r < 0)
                 return r;
 
-        /* Create cgroup */
-        r = session_start_scope(s, properties);
+        r = session_start_scope(s, properties, error);
         if (r < 0)
                 return r;
 
@@ -652,21 +676,24 @@ static int session_stop_scope(Session *s, bool force) {
          * that is left in the scope is "left-over". Informing systemd about this has the benefit that it will log
          * when killing any processes left after this point. */
         r = manager_abandon_scope(s->manager, s->scope, &error);
-        if (r < 0)
+        if (r < 0) {
                 log_warning_errno(r, "Failed to abandon session scope, ignoring: %s", bus_error_message(&error, r));
+                sd_bus_error_free(&error);
+        }
+
+        s->scope_job = mfree(s->scope_job);
 
         /* Optionally, let's kill everything that's left now. */
         if (force || manager_shall_kill(s->manager, s->user->name)) {
-                char *job = NULL;
 
-                r = manager_stop_unit(s->manager, s->scope, &error, &job);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to stop session scope: %s", bus_error_message(&error, r));
+                r = manager_stop_unit(s->manager, s->scope, &error, &s->scope_job);
+                if (r < 0) {
+                        if (force)
+                                return log_error_errno(r, "Failed to stop session scope: %s", bus_error_message(&error, r));
 
-                free(s->scope_job);
-                s->scope_job = job;
+                        log_warning_errno(r, "Failed to stop session scope, ignoring: %s", bus_error_message(&error, r));
+                }
         } else {
-                s->scope_job = mfree(s->scope_job);
 
                 /* With no killing, this session is allowed to persist in "closing" state indefinitely.
                  * Therefore session stop and session removal may be two distinct events.
@@ -686,8 +713,17 @@ int session_stop(Session *s, bool force) {
 
         assert(s);
 
+        /* This is called whenever we begin with tearing down a session record. It's called in four cases: explicit API
+         * request via the bus (either directly for the session object or for the seat or user object this session
+         * belongs to; 'force' is true), or due to automatic GC (i.e. scope vanished; 'force' is false), or because the
+         * session FIFO saw an EOF ('force' is false), or because the release timer hit ('force' is false). */
+
         if (!s->user)
                 return -ESTALE;
+        if (!s->started)
+                return 0;
+        if (s->stopping)
+                return 0;
 
         s->timer_event_source = sd_event_source_unref(s->timer_event_source);
 

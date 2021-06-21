@@ -40,15 +40,85 @@ static void test_parse_uid(void) {
 
         log_info("/* %s */", __func__);
 
+        r = parse_uid("0", &uid);
+        assert_se(r == 0);
+        assert_se(uid == 0);
+
+        r = parse_uid("1", &uid);
+        assert_se(r == 0);
+        assert_se(uid == 1);
+
+        r = parse_uid("01", &uid);
+        assert_se(r == -EINVAL);
+        assert_se(uid == 1);
+
+        r = parse_uid("001", &uid);
+        assert_se(r == -EINVAL);
+        assert_se(uid == 1);
+
         r = parse_uid("100", &uid);
         assert_se(r == 0);
         assert_se(uid == 100);
 
         r = parse_uid("65535", &uid);
         assert_se(r == -ENXIO);
+        assert_se(uid == 100);
+
+        r = parse_uid("0x1234", &uid);
+        assert_se(r == -EINVAL);
+        assert_se(uid == 100);
+
+        r = parse_uid("0o1234", &uid);
+        assert_se(r == -EINVAL);
+        assert_se(uid == 100);
+
+        r = parse_uid("0b1234", &uid);
+        assert_se(r == -EINVAL);
+        assert_se(uid == 100);
+
+        r = parse_uid("+1234", &uid);
+        assert_se(r == -EINVAL);
+        assert_se(uid == 100);
+
+        r = parse_uid("-1234", &uid);
+        assert_se(r == -EINVAL);
+        assert_se(uid == 100);
+
+        r = parse_uid(" 1234", &uid);
+        assert_se(r == -EINVAL);
+        assert_se(uid == 100);
+
+        r = parse_uid("01234", &uid);
+        assert_se(r == -EINVAL);
+        assert_se(uid == 100);
+
+        r = parse_uid("001234", &uid);
+        assert_se(r == -EINVAL);
+        assert_se(uid == 100);
+
+        r = parse_uid("0001234", &uid);
+        assert_se(r == -EINVAL);
+        assert_se(uid == 100);
+
+        r = parse_uid("-0", &uid);
+        assert_se(r == -EINVAL);
+        assert_se(uid == 100);
+
+        r = parse_uid("+0", &uid);
+        assert_se(r == -EINVAL);
+        assert_se(uid == 100);
+
+        r = parse_uid("00", &uid);
+        assert_se(r == -EINVAL);
+        assert_se(uid == 100);
+
+        r = parse_uid("000", &uid);
+        assert_se(r == -EINVAL);
+        assert_se(uid == 100);
 
         r = parse_uid("asdsdas", &uid);
         assert_se(r == -EINVAL);
+        assert_se(uid == 100);
 }
 
 static void test_uid_ptr(void) {

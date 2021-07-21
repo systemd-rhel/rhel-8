@@ -6,7 +6,20 @@ CONT_NAME="${CONT_NAME:-centos-$CENTOS_RELEASE-$RANDOM}"
 DOCKER_EXEC="${DOCKER_EXEC:-docker exec $CONT_NAME}"
 DOCKER_RUN="${DOCKER_RUN:-docker run}"
 REPO_ROOT="${REPO_ROOT:-$PWD}"
-ADDITIONAL_DEPS=(libasan libubsan net-tools strace nc e2fsprogs quota dnsmasq diffutils)
+ADDITIONAL_DEPS=(
+        diffutils
+        dnsmasq
+        e2fsprogs
+        hostname
+        libasan
+        libubsan
+        nc
+        net-tools
+        perl-IPC-SysV
+        perl-Time-HiRes
+        quota
+        strace
+)
 # RHEL8 options
 CONFIGURE_OPTS=(
     -Dsysvinit-path=/etc/rc.d/init.d
@@ -58,6 +71,53 @@ CONFIGURE_OPTS=(
     -Ddefault-hierarchy=legacy
 )
 
+# CentOS 8 Stream still doesn't provide SRPMs, so we can't use dnf's builddep
+# command to fetch this list for us. Hopefully, we'll be able to get rid
+# of this in the future.
+# See: https://bugs.centos.org/view.php?id=16715
+SYSTEMD_BUILD_DEPS=(
+        audit-libs-devel
+        bzip2-devel
+        cryptsetup-devel
+        dbus-devel
+        docbook-style-xsl
+        elfutils-devel
+        firewalld-filesystem
+        gcc
+        gcc-c++
+        gettext
+        git
+        gnu-efi
+        gnu-efi-devel
+        gnutls-devel
+        gobject-introspection-devel
+        gperf
+        iptables-devel
+        kmod-devel
+        libacl-devel
+        libblkid-devel
+        libcap-devel
+        libcurl-devel
+        libgcrypt-devel
+        libgpg-error-devel
+        libidn2-devel
+        libmicrohttpd-devel
+        libmount-devel
+        libseccomp-devel
+        libselinux-devel
+        libxkbcommon-devel
+        libxslt
+        lz4
+        lz4-devel
+        meson
+        pam-devel
+        pkgconf-pkg-config
+        python3-lxml
+        python36-devel
+        tree
+        xz-devel
+)
+
 function info() {
     echo -e "\033[33;1m$1\033[0m"
 }
@@ -68,7 +128,7 @@ for phase in "${PHASES[@]}"; do
     case $phase in
         SETUP)
             info "Setup phase"
-            info "Using Travis $CENTOS_RELEASE"
+            info "Using $CENTOS_RELEASE image"
             # Pull a Docker image and start a new container
             docker pull quay.io/centos/centos:$CENTOS_RELEASE
             info "Starting container $CONT_NAME"
@@ -85,7 +145,10 @@ for phase in "${PHASES[@]}"; do
             # Upgrade the container to get the most recent environment
             $DOCKER_EXEC dnf -y upgrade
             # Install systemd's build dependencies
-            $DOCKER_EXEC dnf -q -y --enablerepo "powertools" builddep systemd
+            if ! $DOCKER_EXEC dnf -q -y --enablerepo "powertools" builddep systemd; then
+                    # See the $SYSTEMD_BUILD_DEPS above for reasoning
+                    $DOCKER_EXEC dnf -q -y --enablerepo "powertools" install "${SYSTEMD_BUILD_DEPS[@]}"
+            fi
             ;;
         RUN|RUN_GCC)
             info "Run phase"
@@ -110,7 +173,6 @@ for phase in "${PHASES[@]}"; do
             docker exec --interactive=false \
                 -e UBSAN_OPTIONS=print_stacktrace=1:print_summary=1:halt_on_error=1 \
                 -e ASAN_OPTIONS=strict_string_checks=1:detect_stack_use_after_return=1:check_initialization_order=1:strict_init_order=1 \
-                -e "TRAVIS=$TRAVIS" \
                 -t $CONT_NAME \
                 meson test --timeout-multiplier=3 -C ./build/ --print-errorlogs
             ;;
